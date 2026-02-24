@@ -2,8 +2,8 @@ import io
 import json
 import zipfile
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
-from typing import Dict, List, Tuple
+from datetime import datetime, timedelta, date
+from typing import Dict, List, Tuple, Set
 
 import numpy as np
 import pandas as pd
@@ -12,10 +12,10 @@ from faker import Faker
 
 
 # ---------------------------
-# Config (v1: no LLM parsing)
+# Config (v1.1: scenarios, no LLM)
 # ---------------------------
 
-@dataclass
+@dataclass(frozen=True)
 class VisitDef:
     visit: str
     visitnum: int  # weeks from baseline
@@ -37,15 +37,14 @@ class GenConfig:
         VisitDef("WK6", 6),
         VisitDef("WK8", 8),
     )
-    severe_ae_rate: float = 0.20  # among AEs
-    # NOTE: v1 uses simple defaults. Later LLM will overwrite these.
+    severe_ae_rate: float = 0.20  # among AEs (approx; demo-level)
     baseline_window_days: int = 60
     visit_jitter_days: int = 3
-    ae_mean_per_subject: float = 0.6  # Poisson mean (0.6 => many subjects have 0 AEs)
+    ae_mean_per_subject: float = 0.6  # Poisson mean
 
 
 # ---------------------------
-# Helpers
+# Seed / helpers
 # ---------------------------
 
 def _set_seed(seed: int):
@@ -61,7 +60,6 @@ def _today() -> date:
 
 
 def _rand_baseline_date(cfg: GenConfig) -> date:
-    # Baseline within last cfg.baseline_window_days
     offset = np.random.randint(0, cfg.baseline_window_days + 1)
     return _today() - timedelta(days=int(offset))
 
@@ -73,36 +71,94 @@ def _visit_date(baseline: date, weeks: int, jitter_days: int) -> date:
 
 
 def _pick_weighted(items: List[str], probs: List[float]) -> str:
-    return str(np.random.choice(items, p=np.array(probs) / np.sum(probs)))
+    p = np.array(probs, dtype=float)
+    p = p / p.sum()
+    return str(np.random.choice(items, p=p))
+
+
+# ---------------------------
+# Scenario planning (dropout / missed visits)
+# ---------------------------
+
+def build_subject_visit_plan(
+    usubjids: List[str],
+    visits: Tuple[VisitDef, ...],
+    dropout_rate: float,
+    missed_visit_rate: float,
+) -> Dict[str, Dict[str, object]]:
+    """
+    Per subject:
+      - last_visitnum: chosen if dropout; otherwise max visitnum
+      - completed_visitnums: subset of visitnums <= last_visitnum, minus missed
+      - missed_visitnums: missed visitnums (baseline never missed)
+    """
+    visitnums = [v.visitnum for v in visits]
+    max_vn = max(visitnums)
+
+    plan: Dict[str, Dict[str, object]] = {}
+    for sid in usubjids:
+        is_dropout = np.random.rand() < dropout_rate
+        last_visitnum = int(np.random.choice(visitnums)) if is_dropout else int(max_vn)
+
+        eligible = [vn for vn in visitnums if vn <= last_visitnum]
+        missed: Set[int] = set()
+        for vn in eligible:
+            if vn == 0:
+                continue
+            if np.random.rand() < missed_visit_rate:
+                missed.add(vn)
+
+        completed = set(eligible) - missed
+        completed.add(0)
+        missed.discard(0)
+
+        plan[sid] = {
+            "last_visitnum": last_visitnum,
+            "completed_visitnums": completed,
+            "missed_visitnums": missed,
+        }
+    return plan
+
+
+# ---------------------------
+# Missingness injection (non-key cells only)
+# ---------------------------
+
+def apply_missingness(df: pd.DataFrame, key_cols: List[str], missing_field_rate: float) -> pd.DataFrame:
+    if df is None or len(df) == 0 or missing_field_rate <= 0:
+        return df
+
+    out = df.copy()
+    cols = [c for c in out.columns if c not in set(key_cols)]
+    if not cols:
+        return out
+
+    mask = np.random.rand(len(out), len(cols)) < missing_field_rate
+    for j, c in enumerate(cols):
+        out.loc[mask[:, j], c] = np.nan
+    return out
 
 
 # ---------------------------
 # Table generators
 # ---------------------------
 
-def generate_dm(cfg: GenConfig, fake: Faker) -> pd.DataFrame:
-    # Sites
+def generate_dm(cfg: GenConfig) -> pd.DataFrame:
     site_ids = [f"S{str(i+1).zfill(3)}" for i in range(cfg.n_sites)]
-
-    # Subjects
     usubjid = [f"RA-{str(i+1).zfill(4)}" for i in range(cfg.n_subjects)]
     site_for_subj = np.random.choice(site_ids, size=cfg.n_subjects, replace=True)
-
-    # Arms assignment
     arm = np.random.choice(list(cfg.arms), size=cfg.n_subjects, p=cfg.arm_ratio)
 
     sexes = ["M", "F"]
     races = ["ASIAN", "WHITE", "BLACK", "OTHER"]
     race_probs = [0.45, 0.35, 0.10, 0.10]
-
     countries = ["IND", "USA", "GBR", "DEU", "FRA", "CAN", "AUS"]
     country_probs = [0.50, 0.12, 0.08, 0.08, 0.07, 0.07, 0.08]
 
     rows = []
     for i in range(cfg.n_subjects):
-        age = int(np.random.randint(18, 76))  # typical adult RA trial
+        age = int(np.random.randint(18, 76))
         randdt = _rand_baseline_date(cfg)
-
         rows.append(
             {
                 "STUDYID": cfg.studyid,
@@ -116,13 +172,10 @@ def generate_dm(cfg: GenConfig, fake: Faker) -> pd.DataFrame:
                 "COUNTRY": _pick_weighted(countries, country_probs),
             }
         )
-
-    dm = pd.DataFrame(rows)
-    return dm
+    return pd.DataFrame(rows)
 
 
 def generate_mh(cfg: GenConfig, dm: pd.DataFrame) -> pd.DataFrame:
-    # 0–3 MH rows per subject
     mh_terms = [
         "Hypertension",
         "Type 2 Diabetes Mellitus",
@@ -137,15 +190,13 @@ def generate_mh(cfg: GenConfig, dm: pd.DataFrame) -> pd.DataFrame:
     mhid_counter = 1
 
     for _, r in dm.iterrows():
-        k = int(np.random.randint(0, 4))  # 0..3
-        randdt = datetime.fromisoformat(r["RANDDT"]).date()
+        k = int(np.random.randint(0, 4))  # 0..3 per subject
+        randdt = datetime.fromisoformat(str(r["RANDDT"])).date()
         for _ in range(k):
             term = np.random.choice(mh_terms)
-            # start date before baseline (up to 10 years)
             back_days = int(np.random.randint(30, 3650))
             mhstdtc = (randdt - timedelta(days=back_days)).isoformat()
             ongoing = np.random.choice(["Y", "N"], p=[0.75, 0.25])
-
             rows.append(
                 {
                     "STUDYID": cfg.studyid,
@@ -157,40 +208,32 @@ def generate_mh(cfg: GenConfig, dm: pd.DataFrame) -> pd.DataFrame:
                 }
             )
             mhid_counter += 1
-
     return pd.DataFrame(rows)
 
 
-def _baseline_vs_profile(sex: str, age: int) -> Dict[str, float]:
-    # Loose plausible baselines
-    weight = np.random.normal(72, 14)
-    weight = _clamp(weight, 40, 120)
-
-    sysbp = np.random.normal(125, 15)
-    diast = np.random.normal(78, 10)
-    hr = np.random.normal(78, 12)
-    temp = np.random.normal(36.8, 0.3)
-
-    return {
-        "WEIGHT_KG": _clamp(weight, 40, 120),
-        "SYSBP": _clamp(sysbp, 90, 170),
-        "DIABP": _clamp(diast, 55, 110),
-        "HR": _clamp(hr, 50, 120),
-        "TEMP_C": _clamp(temp, 36.0, 39.0),
-    }
+def _baseline_vs_profile() -> Dict[str, float]:
+    weight = _clamp(np.random.normal(72, 14), 40, 120)
+    sysbp = _clamp(np.random.normal(125, 15), 90, 170)
+    diast = _clamp(np.random.normal(78, 10), 55, 110)
+    hr = _clamp(np.random.normal(78, 12), 50, 120)
+    temp = _clamp(np.random.normal(36.8, 0.3), 36.0, 39.0)
+    return {"WEIGHT_KG": weight, "SYSBP": sysbp, "DIABP": diast, "HR": hr, "TEMP_C": temp}
 
 
-def generate_vs(cfg: GenConfig, dm: pd.DataFrame) -> pd.DataFrame:
+def generate_vs(cfg: GenConfig, dm: pd.DataFrame, visit_plan: Dict[str, Dict[str, object]]) -> pd.DataFrame:
     rows = []
     for _, r in dm.iterrows():
-        baseline = datetime.fromisoformat(r["RANDDT"]).date()
-        prof = _baseline_vs_profile(r["SEX"], int(r["AGE"]))
+        sid = str(r["USUBJID"])
+        baseline = datetime.fromisoformat(str(r["RANDDT"])).date()
+        prof = _baseline_vs_profile()
+        completed = visit_plan[sid]["completed_visitnums"]  # type: ignore
 
-        # small drift + noise across visits
         for v in cfg.visits:
+            if v.visitnum not in completed:
+                continue
             vdt = _visit_date(baseline, v.visitnum, cfg.visit_jitter_days)
 
-            # weight: small random walk
+            # gentle drift
             prof["WEIGHT_KG"] = _clamp(prof["WEIGHT_KG"] + np.random.normal(0, 0.6), 40, 120)
             prof["SYSBP"] = _clamp(prof["SYSBP"] + np.random.normal(0, 2.5), 90, 170)
             prof["DIABP"] = _clamp(prof["DIABP"] + np.random.normal(0, 2.0), 55, 110)
@@ -200,7 +243,7 @@ def generate_vs(cfg: GenConfig, dm: pd.DataFrame) -> pd.DataFrame:
             rows.append(
                 {
                     "STUDYID": cfg.studyid,
-                    "USUBJID": r["USUBJID"],
+                    "USUBJID": sid,
                     "VISIT": v.visit,
                     "VISITNUM": v.visitnum,
                     "VISITDT": vdt.isoformat(),
@@ -211,37 +254,35 @@ def generate_vs(cfg: GenConfig, dm: pd.DataFrame) -> pd.DataFrame:
                     "WEIGHT_KG": round(prof["WEIGHT_KG"], 1),
                 }
             )
-
-    vs = pd.DataFrame(rows)
-    return vs
+    return pd.DataFrame(rows)
 
 
-def _baseline_lb_profile(arm: str) -> Dict[str, float]:
-    # RA-ish inflammation elevated at baseline; treatment can slightly improve across visits (optional)
-    crp = _clamp(np.random.lognormal(mean=np.log(8), sigma=0.55), 0.2, 60.0)  # mg/L-ish
-    esr = _clamp(np.random.normal(35, 18), 2, 120)  # mm/hr-ish
-
+def _baseline_lb_profile() -> Dict[str, float]:
+    crp = _clamp(np.random.lognormal(mean=np.log(8), sigma=0.55), 0.2, 60.0)
+    esr = _clamp(np.random.normal(35, 18), 2, 120)
     alt = _clamp(np.random.normal(25, 10), 5, 120)
     ast = _clamp(np.random.normal(23, 9), 5, 120)
     hgb = _clamp(np.random.normal(13.2, 1.4), 8.0, 18.0)
     wbc = _clamp(np.random.normal(6.8, 1.8), 2.5, 16.0)
     plt = _clamp(np.random.normal(290, 70), 100, 600)
-
     return {"CRP": crp, "ESR": esr, "ALT": alt, "AST": ast, "HGB": hgb, "WBC": wbc, "PLT": plt}
 
 
-def generate_lb(cfg: GenConfig, dm: pd.DataFrame) -> pd.DataFrame:
+def generate_lb(cfg: GenConfig, dm: pd.DataFrame, visit_plan: Dict[str, Dict[str, object]]) -> pd.DataFrame:
     rows = []
     for _, r in dm.iterrows():
-        baseline = datetime.fromisoformat(r["RANDDT"]).date()
-        arm = r["ARM"]
-        prof = _baseline_lb_profile(arm)
+        sid = str(r["USUBJID"])
+        baseline = datetime.fromisoformat(str(r["RANDDT"])).date()
+        arm = str(r["ARM"])
+        prof = _baseline_lb_profile()
+        completed = visit_plan[sid]["completed_visitnums"]  # type: ignore
 
         for idx, v in enumerate(cfg.visits):
+            if v.visitnum not in completed:
+                continue
             vdt = _visit_date(baseline, v.visitnum, cfg.visit_jitter_days)
 
-            # Optional simple "treatment improves inflammation" flavor:
-            # treatment: CRP/ESR drift down slightly over time; placebo: flat/noisy
+            # simple "flavor": treatment improves inflammation
             if idx > 0:
                 if arm == "TRT":
                     prof["CRP"] = _clamp(prof["CRP"] * np.random.uniform(0.88, 0.98), 0.1, 60.0)
@@ -250,10 +291,8 @@ def generate_lb(cfg: GenConfig, dm: pd.DataFrame) -> pd.DataFrame:
                     prof["CRP"] = _clamp(prof["CRP"] * np.random.uniform(0.95, 1.05), 0.1, 60.0)
                     prof["ESR"] = _clamp(prof["ESR"] + np.random.normal(0.0, 5.0), 2, 120)
 
-            # Liver enzymes mostly stable, occasional bumps
             prof["ALT"] = _clamp(prof["ALT"] + np.random.normal(0, 3.5), 5, 180)
             prof["AST"] = _clamp(prof["AST"] + np.random.normal(0, 3.0), 5, 180)
-
             prof["HGB"] = _clamp(prof["HGB"] + np.random.normal(0, 0.2), 8.0, 18.0)
             prof["WBC"] = _clamp(prof["WBC"] + np.random.normal(0, 0.4), 2.5, 18.0)
             prof["PLT"] = _clamp(prof["PLT"] + np.random.normal(0, 10), 100, 700)
@@ -261,7 +300,7 @@ def generate_lb(cfg: GenConfig, dm: pd.DataFrame) -> pd.DataFrame:
             rows.append(
                 {
                     "STUDYID": cfg.studyid,
-                    "USUBJID": r["USUBJID"],
+                    "USUBJID": sid,
                     "VISIT": v.visit,
                     "VISITNUM": v.visitnum,
                     "VISITDT": vdt.isoformat(),
@@ -274,12 +313,10 @@ def generate_lb(cfg: GenConfig, dm: pd.DataFrame) -> pd.DataFrame:
                     "PLT": int(round(prof["PLT"], 0)),
                 }
             )
-
-    lb = pd.DataFrame(rows)
-    return lb
+    return pd.DataFrame(rows)
 
 
-def generate_ae(cfg: GenConfig, dm: pd.DataFrame) -> pd.DataFrame:
+def generate_ae(cfg: GenConfig, dm: pd.DataFrame, visit_plan: Dict[str, Dict[str, object]]) -> pd.DataFrame:
     ae_terms = [
         "Headache",
         "Nausea",
@@ -299,44 +336,42 @@ def generate_ae(cfg: GenConfig, dm: pd.DataFrame) -> pd.DataFrame:
     aeid_counter = 1
 
     for _, r in dm.iterrows():
-        baseline = datetime.fromisoformat(r["RANDDT"]).date()
-        last_visit = _visit_date(baseline, cfg.visits[-1].visitnum, cfg.visit_jitter_days)
+        sid = str(r["USUBJID"])
+        baseline = datetime.fromisoformat(str(r["RANDDT"])).date()
+
+        # cap AE window at subject's last completed visit (+7 days)
+        last_vn = int(visit_plan[sid]["last_visitnum"])  # type: ignore
+        last_visit = _visit_date(baseline, last_vn, cfg.visit_jitter_days)
         study_end = last_visit + timedelta(days=7)
 
         n_ae = int(np.random.poisson(cfg.ae_mean_per_subject))
-        # Cap for demo readability
         n_ae = min(n_ae, 4)
 
         for _ in range(n_ae):
             term = np.random.choice(ae_terms)
 
-            # Start any time in study window
             total_days = max((study_end - baseline).days, 1)
             start_offset = int(np.random.randint(0, total_days))
             aestdt = baseline + timedelta(days=start_offset)
 
-            # Duration 1-14 days typical
             dur = int(np.random.randint(1, 15))
             aeendt = min(aestdt + timedelta(days=dur), study_end)
 
-            # Severity
-            sev = _pick_weighted(["MILD", "MODERATE", "SEVERE"], [0.55, 0.25, cfg.severe_ae_rate])
-            # Normalize so severe rate is "about" cfg.severe_ae_rate by using weighted pick:
-            # (not exact; good enough for demo)
-
+            # approximate severe rate via weights
+            sev = _pick_weighted(["MILD", "MODERATE", "SEVERE"], [0.55, 0.25, float(cfg.severe_ae_rate)])
             aeser = "Y" if sev == "SEVERE" else _pick_weighted(["Y", "N"], [0.05, 0.95])
             aere = _pick_weighted(rel_terms, rel_probs)
 
             rows.append(
                 {
                     "STUDYID": cfg.studyid,
-                    "USUBJID": r["USUBJID"],
+                    "USUBJID": sid,
                     "AEID": f"AE-{str(aeid_counter).zfill(6)}",
                     "AETERM": term,
                     "AESTDTC": aestdt.isoformat(),
                     "AEENDTC": aeendt.isoformat(),
                     "AESEV": sev,
-                    "AESER": aeser if sev != "SEVERE" else "Y",
+                    "AESER": "Y" if sev == "SEVERE" else aeser,
                     "AEREL": aere,
                 }
             )
@@ -346,11 +381,11 @@ def generate_ae(cfg: GenConfig, dm: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---------------------------
-# Validation (v1)
+# Validation (v1.1: supports missing visits / dropout)
 # ---------------------------
 
 def validate_tables(cfg: GenConfig, dm: pd.DataFrame, mh: pd.DataFrame, vs: pd.DataFrame, lb: pd.DataFrame, ae: pd.DataFrame) -> List[str]:
-    issues = []
+    issues: List[str] = []
 
     # DM: USUBJID unique
     if dm["USUBJID"].duplicated().any():
@@ -360,44 +395,39 @@ def validate_tables(cfg: GenConfig, dm: pd.DataFrame, mh: pd.DataFrame, vs: pd.D
 
     # FK checks
     for name, df in [("MH", mh), ("VS", vs), ("LB", lb), ("AE", ae)]:
-        if len(df) == 0:
+        if df is None or len(df) == 0:
             continue
         bad = set(df["USUBJID"].astype(str).tolist()) - subj_set
         if bad:
-            issues.append(f"{name}: FK violation USUBJID not in DM: {sorted(list(bad))[:5]}...")
+            issues.append(f"{name}: FK violation (USUBJID not in DM). Example: {sorted(list(bad))[:5]}")
 
-    # VS/LB: exactly one row per subject per visit
-    expected = cfg.n_subjects * len(cfg.visits)
-    if len(vs) != expected:
-        issues.append(f"VS: expected {expected} rows, found {len(vs)}.")
-    if len(lb) != expected:
-        issues.append(f"LB: expected {expected} rows, found {len(lb)}.")
-
-    # Visit integrity: valid visit labels and nums
-    valid_visits = set([v.visit for v in cfg.visits])
-    valid_nums = set([v.visitnum for v in cfg.visits])
-
+    # VS/LB: no duplicate (USUBJID, VISITNUM)
     for name, df in [("VS", vs), ("LB", lb)]:
-        if not set(df["VISIT"].unique()).issubset(valid_visits):
-            issues.append(f"{name}: unexpected VISIT values.")
-        if not set(df["VISITNUM"].unique()).issubset(valid_nums):
-            issues.append(f"{name}: unexpected VISITNUM values.")
+        if df is None or len(df) == 0:
+            continue
+        if df.duplicated(subset=["USUBJID", "VISITNUM"]).any():
+            issues.append(f"{name}: duplicate (USUBJID, VISITNUM) rows found.")
 
-        # Date ordering per subject
+        # VISITNUM subset of schedule
+        valid_nums = set([v.visitnum for v in cfg.visits])
+        if not set(df["VISITNUM"].unique()).issubset(valid_nums):
+            issues.append(f"{name}: unexpected VISITNUM values found.")
+
+        # Date ordering per subject (only for observed visits)
         for usubjid, g in df.groupby("USUBJID"):
-            dts = [datetime.fromisoformat(x).date() for x in g.sort_values("VISITNUM")["VISITDT"].tolist()]
-            if any(dts[i] > dts[i+1] for i in range(len(dts)-1)):
+            gg = g.sort_values("VISITNUM")
+            dts = [datetime.fromisoformat(str(x)).date() for x in gg["VISITDT"].tolist()]
+            if any(dts[i] > dts[i + 1] for i in range(len(dts) - 1)):
                 issues.append(f"{name}: VISITDT not increasing for subject {usubjid}.")
                 break
 
-    # AE date logic: end >= start
-    if len(ae) > 0:
+    # AE: end >= start; severe -> AESER=Y
+    if ae is not None and len(ae) > 0:
         s = pd.to_datetime(ae["AESTDTC"], errors="coerce")
         e = pd.to_datetime(ae["AEENDTC"], errors="coerce")
         if (e < s).any():
             issues.append("AE: AEENDTC earlier than AESTDTC for some rows.")
 
-        # Severe -> AESER must be Y
         bad_severe = ae[(ae["AESEV"] == "SEVERE") & (ae["AESER"] != "Y")]
         if len(bad_severe) > 0:
             issues.append("AE: severe AE with AESER != Y found.")
@@ -406,8 +436,69 @@ def validate_tables(cfg: GenConfig, dm: pd.DataFrame, mh: pd.DataFrame, vs: pd.D
 
 
 # ---------------------------
+# Reporting (v1.1)
+# ---------------------------
+
+def basic_report(cfg: GenConfig, dm: pd.DataFrame, mh: pd.DataFrame, vs: pd.DataFrame, lb: pd.DataFrame, ae: pd.DataFrame) -> Dict:
+    report: Dict = {}
+    report["row_counts"] = {
+        "DM": int(len(dm)),
+        "MH": int(len(mh)) if mh is not None else 0,
+        "VS": int(len(vs)) if vs is not None else 0,
+        "LB": int(len(lb)) if lb is not None else 0,
+        "AE": int(len(ae)) if ae is not None else 0,
+    }
+
+    n_subj = int(len(dm))
+    report["n_subjects"] = n_subj
+
+    visitnums = [v.visitnum for v in cfg.visits]
+
+    def completion(df: pd.DataFrame) -> Dict[str, float]:
+        if df is None or len(df) == 0:
+            return {str(v): 0.0 for v in visitnums}
+        out = {}
+        for v in visitnums:
+            n = df[df["VISITNUM"] == v]["USUBJID"].nunique()
+            out[str(v)] = float(n) / float(n_subj) if n_subj else 0.0
+        return out
+
+    report["vs_completion_by_visitnum"] = completion(vs)
+    report["lb_completion_by_visitnum"] = completion(lb)
+
+    def missingness(df: pd.DataFrame) -> float:
+        if df is None or len(df) == 0:
+            return 0.0
+        total = df.size
+        miss = int(df.isna().sum().sum())
+        return float(miss) / float(total) if total else 0.0
+
+    report["missingness_fraction"] = {
+        "DM": missingness(dm),
+        "MH": missingness(mh) if mh is not None else 0.0,
+        "VS": missingness(vs) if vs is not None else 0.0,
+        "LB": missingness(lb) if lb is not None else 0.0,
+        "AE": missingness(ae) if ae is not None else 0.0,
+    }
+
+    if ae is not None and len(ae) > 0 and "AESEV" in ae.columns:
+        sev = ae["AESEV"].value_counts(dropna=False).to_dict()
+        report["ae_severity_counts"] = {str(k): int(v) for k, v in sev.items()}
+        report["ae_severity_fraction"] = {str(k): float(v) / float(len(ae)) for k, v in sev.items()}
+    else:
+        report["ae_severity_counts"] = {}
+        report["ae_severity_fraction"] = {}
+
+    return report
+
+
+# ---------------------------
 # Export
 # ---------------------------
+
+def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
+    return df.to_csv(index=False).encode("utf-8")
+
 
 def make_zip_bytes(files: Dict[str, bytes]) -> bytes:
     buf = io.BytesIO()
@@ -417,28 +508,31 @@ def make_zip_bytes(files: Dict[str, bytes]) -> bytes:
     return buf.getvalue()
 
 
-def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
-    return df.to_csv(index=False).encode("utf-8")
-
-
 # ---------------------------
 # Streamlit UI
 # ---------------------------
 
-st.set_page_config(page_title="Synthetic EDC Data Generator (v1)", layout="wide")
-st.title("Synthetic EDC Data Generator (v1)")
-st.caption("v1: No LLM parsing. Uses a fixed demo schema with integrity checks. Output = ZIP of CSVs + manifest.")
+st.set_page_config(page_title="Synthetic EDC Data Generator (v1.1)", layout="wide")
+st.title("Synthetic EDC Data Generator (v1.1)")
+st.caption("v1.1: Dropout + missed visits + missing fields. No LLM prompt parsing yet.")
 
 with st.sidebar:
     st.header("Controls")
+
     seed = st.number_input("Seed", min_value=0, max_value=10_000_000, value=42, step=1)
     n_subjects = st.slider("Number of subjects", min_value=10, max_value=500, value=100, step=10)
     n_sites = st.slider("Number of sites", min_value=1, max_value=50, value=5, step=1)
+
     severe_rate = st.slider("Severe AE rate (among AEs)", min_value=0.0, max_value=0.8, value=0.20, step=0.05)
     ae_mean = st.slider("Mean AEs per subject (Poisson)", min_value=0.0, max_value=3.0, value=0.6, step=0.1)
 
+    st.subheader("Scenario knobs (v1.1)")
+    dropout_rate = st.slider("Dropout rate", 0.0, 0.6, value=0.10, step=0.05)
+    missed_visit_rate = st.slider("Missed visit rate (per scheduled visit)", 0.0, 0.3, value=0.05, step=0.05)
+    missing_field_rate = st.slider("Missing field rate (non-key cells)", 0.0, 0.2, value=0.02, step=0.02)
+
 prompt = st.text_area(
-    "Prompt (stored in manifest; ignored by v1 generator)",
+    "Prompt (stored in manifest; ignored by v1.1 generator)",
     value=(
         "You are a synthetic data generator agent for clinical trial EDC system. "
         "Generate 100 patients across treatment and placebo cohort for rheumatoid arthritis phase 2 trial, "
@@ -457,20 +551,36 @@ if colA.button("Generate dataset", type="primary"):
         severe_ae_rate=float(severe_rate),
         ae_mean_per_subject=float(ae_mean),
     )
+
     _set_seed(int(seed))
-    fake = Faker()
     Faker.seed(int(seed))
 
-    dm = generate_dm(cfg, fake)
+    dm = generate_dm(cfg)
+
+    visit_plan = build_subject_visit_plan(
+        usubjids=dm["USUBJID"].astype(str).tolist(),
+        visits=cfg.visits,
+        dropout_rate=float(dropout_rate),
+        missed_visit_rate=float(missed_visit_rate),
+    )
+
     mh = generate_mh(cfg, dm)
-    vs = generate_vs(cfg, dm)
-    lb = generate_lb(cfg, dm)
-    ae = generate_ae(cfg, dm)
+    vs = generate_vs(cfg, dm, visit_plan)
+    lb = generate_lb(cfg, dm, visit_plan)
+    ae = generate_ae(cfg, dm, visit_plan)
+
+    # Inject missingness (non-key cells only)
+    dm = apply_missingness(dm, key_cols=["STUDYID", "SITEID", "USUBJID"], missing_field_rate=float(missing_field_rate))
+    mh = apply_missingness(mh, key_cols=["STUDYID", "USUBJID", "MHID"], missing_field_rate=float(missing_field_rate))
+    vs = apply_missingness(vs, key_cols=["STUDYID", "USUBJID", "VISIT", "VISITNUM"], missing_field_rate=float(missing_field_rate))
+    lb = apply_missingness(lb, key_cols=["STUDYID", "USUBJID", "VISIT", "VISITNUM"], missing_field_rate=float(missing_field_rate))
+    ae = apply_missingness(ae, key_cols=["STUDYID", "USUBJID", "AEID"], missing_field_rate=float(missing_field_rate))
 
     issues = validate_tables(cfg, dm, mh, vs, lb, ae)
+    report = basic_report(cfg, dm, mh, vs, lb, ae)
 
     manifest = {
-        "version": "v1",
+        "version": "v1.1",
         "generated_at_utc": datetime.utcnow().isoformat() + "Z",
         "seed": int(seed),
         "prompt": prompt,
@@ -483,16 +593,15 @@ if colA.button("Generate dataset", type="primary"):
             "arms": list(cfg.arms),
             "arm_ratio": list(cfg.arm_ratio),
             "visits": [{"visit": v.visit, "visitnum": v.visitnum} for v in cfg.visits],
-            "severe_ae_rate": cfg.severe_ae_rate,
-            "ae_mean_per_subject": cfg.ae_mean_per_subject,
+            "severe_ae_rate": float(cfg.severe_ae_rate),
+            "ae_mean_per_subject": float(cfg.ae_mean_per_subject),
         },
-        "row_counts": {
-            "DM": int(len(dm)),
-            "MH": int(len(mh)),
-            "VS": int(len(vs)),
-            "LB": int(len(lb)),
-            "AE": int(len(ae)),
+        "scenario_knobs": {
+            "dropout_rate": float(dropout_rate),
+            "missed_visit_rate": float(missed_visit_rate),
+            "missing_field_rate": float(missing_field_rate),
         },
+        "report": report,
         "validation_issues": issues,
     }
 
@@ -509,7 +618,7 @@ if colA.button("Generate dataset", type="primary"):
 
     st.success("Generated.")
     if issues:
-        st.warning("Validation issues found (v1 is basic):")
+        st.warning("Validation issues found:")
         for it in issues:
             st.write(f"- {it}")
     else:
@@ -518,11 +627,13 @@ if colA.button("Generate dataset", type="primary"):
     st.download_button(
         "Download ZIP (CSVs + manifest)",
         data=zip_bytes,
-        file_name="syn_edc_demo.zip",
+        file_name="syn_edc_demo_v1_1.zip",
         mime="application/zip",
     )
 
-    # Previews
+    st.subheader("Report card")
+    st.json(report)
+
     with st.expander("Preview: DM"):
         st.dataframe(dm.head(50), use_container_width=True)
     with st.expander("Preview: MH"):
@@ -536,10 +647,11 @@ if colA.button("Generate dataset", type="primary"):
 
 colB.markdown(
     """
-**What this v1 demonstrates**
+**What v1.1 demonstrates**
 - 5-table relational output (PK/FK integrity)
 - fixed visit schedule (baseline, wk2, wk4, wk6, wk8)
-- longitudinal VS/LB per visit
+- dropout + missed visits (VS/LB incomplete by design)
+- missing fields to mimic partial EDC entry
 - AE generation with severe fraction and date logic
 - reproducible generation via seed
 """
