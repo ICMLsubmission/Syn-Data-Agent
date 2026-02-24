@@ -572,10 +572,10 @@ if colA.button("Generate dataset", type="primary"):
     # Inject missingness (non-key cells only)
     dm = apply_missingness(dm, key_cols=["STUDYID", "SITEID", "USUBJID"], missing_field_rate=float(missing_field_rate))
     mh = apply_missingness(mh, key_cols=["STUDYID", "USUBJID", "MHID"], missing_field_rate=float(missing_field_rate))
-    vs = apply_missingness(vs, key_cols=["STUDYID", "USUBJID", "VISIT", "VISITNUM"], missing_field_rate=float(missing_field_rate))
-    lb = apply_missingness(lb, key_cols=["STUDYID", "USUBJID", "VISIT", "VISITNUM"], missing_field_rate=float(missing_field_rate))
-    ae = apply_missingness(ae, key_cols=["STUDYID", "USUBJID", "AEID"], missing_field_rate=float(missing_field_rate))
-
+    vs = apply_missingness(vs, key_cols=["STUDYID", "USUBJID", "VISIT", "VISITNUM", "VISITDT"], missing_field_rate=float(missing_field_rate))
+    lb = apply_missingness(lb, key_cols=["STUDYID", "USUBJID", "VISIT", "VISITNUM", "VISITDT"], missing_field_rate=float(missing_field_rate))
+    ae = apply_missingness(ae, key_cols=["STUDYID", "USUBJID", "AEID", "AESTDTC", "AEENDTC"], missing_field_rate=float(missing_field_rate))
+    
     issues = validate_tables(cfg, dm, mh, vs, lb, ae)
     report = basic_report(cfg, dm, mh, vs, lb, ae)
 
